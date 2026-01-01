@@ -1,5 +1,5 @@
 'use client';
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Upload, File, Image, Video, Music, FileText, X, Eye, Play, Download } from 'lucide-react';
 
 interface UploadedFile {
@@ -7,39 +7,231 @@ interface UploadedFile {
   name: string;
   size: number;
   type: string;
-  file: File;
   url: string;
   textContent?: string;
+}
+
+interface FileMetadata {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  uploadedAt: number;
 }
 
 export default function FileUploader() {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [viewingFile, setViewingFile] = useState<UploadedFile | null>(null);
   const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileCacheRef = useRef<Map<string, UploadedFile>>(new Map());
+  const eventSourceRef = useRef<EventSource | null>(null);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const uploadedFiles = Array.from(e.target.files || []);
-    
-    const newFiles: UploadedFile[] = uploadedFiles.map(file => ({
-      id: Math.random().toString(36).substr(2, 9),
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      file: file,
-      url: URL.createObjectURL(file)
-    }));
+  // Connect to Server-Sent Events for real-time updates
+  useEffect(() => {
+    const connectSSE = () => {
+      try {
+        const eventSource = new EventSource('/api/files/stream');
+        eventSourceRef.current = eventSource;
 
-    setFiles(prev => [...prev, ...newFiles]);
+        eventSource.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.files) {
+              syncFiles(data.files as FileMetadata[]);
+            }
+          } catch (error) {
+            console.error('Error parsing SSE message:', error);
+          }
+        };
+
+        eventSource.onerror = (error) => {
+          console.error('SSE error:', error);
+          eventSource.close();
+          // Reconnect after 3 seconds
+          setTimeout(connectSSE, 3000);
+        };
+      } catch (error) {
+        console.error('Error connecting to SSE:', error);
+      }
+    };
+
+    connectSSE();
+
+    // Initial load
+    fetchFiles();
+
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+      // Clean up object URLs
+      fileCacheRef.current.forEach(file => {
+        if (file.url && file.url.startsWith('blob:')) {
+          URL.revokeObjectURL(file.url);
+        }
+      });
+    };
+  }, []);
+
+  const fetchFiles = async () => {
+    try {
+      const response = await fetch('/api/files');
+      const data = await response.json();
+      if (data.files) {
+        syncFiles(data.files as FileMetadata[]);
+      }
+    } catch (error) {
+      console.error('Error fetching files:', error);
+    }
   };
 
-  const removeFile = (id: string) => {
-    setFiles(prev => {
-      const fileToRemove = prev.find(f => f.id === id);
-      if (fileToRemove) {
-        URL.revokeObjectURL(fileToRemove.url);
+  const syncFiles = async (fileMetadataList: FileMetadata[]) => {
+    // Get current file IDs from cache
+    const currentIds = new Set(Array.from(fileCacheRef.current.keys()));
+    const newIds = new Set(fileMetadataList.map(f => f.id));
+
+    // Remove files that no longer exist
+    const toRemove = Array.from(currentIds).filter(id => !newIds.has(id));
+    toRemove.forEach(id => {
+      const file = fileCacheRef.current.get(id);
+      if (file && file.url.startsWith('blob:')) {
+        URL.revokeObjectURL(file.url);
       }
-      return prev.filter(f => f.id !== id);
+      fileCacheRef.current.delete(id);
     });
+
+    // Add/update new files
+    const updatedFiles: UploadedFile[] = await Promise.all(
+      fileMetadataList.map(async (metadata) => {
+        // Check cache first
+        if (fileCacheRef.current.has(metadata.id)) {
+          return fileCacheRef.current.get(metadata.id)!;
+        }
+
+        // Fetch file data
+        try {
+          const response = await fetch(`/api/files/${metadata.id}`);
+          const fileData = await response.json();
+          
+          const uploadedFile: UploadedFile = {
+            id: metadata.id,
+            name: metadata.name,
+            size: metadata.size,
+            type: metadata.type,
+            url: fileData.data, // base64 data URL
+          };
+
+          // Load text content for text files
+          if (metadata.type === 'text/plain' && fileData.data) {
+            try {
+              // Extract base64 content from data URL
+              const base64Data = fileData.data.split(',')[1];
+              if (base64Data) {
+                const text = atob(base64Data);
+                uploadedFile.textContent = text;
+              }
+            } catch (error) {
+              console.error('Error loading text content:', error);
+            }
+          }
+
+          fileCacheRef.current.set(metadata.id, uploadedFile);
+          return uploadedFile;
+        } catch (error) {
+          console.error('Error fetching file data:', error);
+          // Return placeholder if fetch fails
+          return {
+            id: metadata.id,
+            name: metadata.name,
+            size: metadata.size,
+            type: metadata.type,
+            url: '',
+          };
+        }
+      })
+    );
+
+    setFiles(updatedFiles);
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(e.target.files || []);
+    
+    if (selectedFiles.length === 0) return;
+
+    setIsUploading(true);
+
+    try {
+      const formData = new FormData();
+      selectedFiles.forEach(file => {
+        formData.append('files', file);
+      });
+
+      const response = await fetch('/api/files', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to upload files');
+      }
+
+      // Reset input
+      e.target.value = '';
+      
+      // Files will be synced via SSE
+    } catch (error) {
+      console.error('Error uploading files:', error);
+      alert('Failed to upload files. Please try again.');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const removeFile = async (id: string) => {
+    try {
+      const response = await fetch(`/api/files?id=${id}`, {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to delete file');
+      }
+
+      // File will be removed via SSE sync
+      const file = fileCacheRef.current.get(id);
+      if (file && file.url.startsWith('blob:')) {
+        URL.revokeObjectURL(file.url);
+      }
+      fileCacheRef.current.delete(id);
+    } catch (error) {
+      console.error('Error deleting file:', error);
+      alert('Failed to delete file. Please try again.');
+    }
+  };
+
+  const clearAllFiles = async () => {
+    try {
+      const response = await fetch('/api/files', {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to clear files');
+      }
+
+      // Files will be cleared via SSE sync
+      fileCacheRef.current.forEach(file => {
+        if (file.url.startsWith('blob:')) {
+          URL.revokeObjectURL(file.url);
+        }
+      });
+      fileCacheRef.current.clear();
+    } catch (error) {
+      console.error('Error clearing files:', error);
+      alert('Failed to clear files. Please try again.');
+    }
   };
 
   const formatFileSize = (bytes: number): string => {
@@ -70,6 +262,14 @@ export default function FileUploader() {
   };
 
   const renderPreview = (file: UploadedFile) => {
+    if (!file.url) {
+      return (
+        <div className="flex items-center justify-center h-48 bg-gray-100 rounded-lg">
+          <p className="text-sm text-gray-500">Loading...</p>
+        </div>
+      );
+    }
+
     if (file.type.startsWith('image/')) {
       return (
         <img 
@@ -155,39 +355,25 @@ export default function FileUploader() {
     );
   };
 
-  React.useEffect(() => {
-    files.forEach(file => {
-      if (file.type === 'text/plain' && !file.textContent) {
-        const reader = new FileReader();
-        reader.onload = (e: ProgressEvent<FileReader>) => {
-          setFiles(prev => prev.map(f => 
-            f.id === file.id ? {...f, textContent: e.target?.result as string} : f
-          ));
-        };
-        reader.readAsText(file.file);
-      }
-    });
-  }, [files]);
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-purple-50">
       <div className="max-w-6xl mx-auto p-8">
         <div className="text-center mb-12">
           <h1 className="text-4xl font-bold text-gray-800 mb-3">
-            Temporary File Uploader
+            Real-Time File Sharing
           </h1>
           <p className="text-gray-600">
-            Upload any file type including APK • No storage • Clears on refresh
+            Upload files • Shared with everyone • In-memory only (no disk storage) • Clears on refresh
           </p>
         </div>
 
         <div className="mb-12">
           <label className="block">
-            <div className="relative border-4 border-dashed border-blue-400 rounded-2xl p-12 text-center cursor-pointer hover:border-blue-600 hover:bg-blue-50 transition-all duration-200">
+            <div className={`relative border-4 border-dashed border-blue-400 rounded-2xl p-12 text-center cursor-pointer hover:border-blue-600 hover:bg-blue-50 transition-all duration-200 ${isUploading ? 'opacity-50 cursor-not-allowed' : ''}`}>
               <div className="absolute -top-1 left-0 right-0 h-2 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 rounded-t-2xl"></div>
               <Upload className="w-16 h-16 mx-auto mb-4 text-blue-500" />
               <p className="text-xl font-semibold text-gray-700 mb-2">
-                Click to upload or drag and drop
+                {isUploading ? 'Uploading...' : 'Click to upload or drag and drop'}
               </p>
               <p className="text-sm text-gray-500">
                 Images, videos, documents, audio, APK files, and more
@@ -198,6 +384,7 @@ export default function FileUploader() {
                 onChange={handleFileUpload}
                 className="hidden"
                 accept="*/*"
+                disabled={isUploading}
               />
             </div>
           </label>
@@ -207,13 +394,10 @@ export default function FileUploader() {
           <div>
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-2xl font-bold text-gray-800">
-                Uploaded Files ({files.length})
+                Shared Files ({files.length})
               </h2>
               <button
-                onClick={() => {
-                  files.forEach(f => URL.revokeObjectURL(f.url));
-                  setFiles([]);
-                }}
+                onClick={clearAllFiles}
                 className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors text-sm font-medium"
               >
                 Clear All
@@ -279,7 +463,7 @@ export default function FileUploader() {
                         )}
                       </div>
                     </div>
-                    {playingAudio === file.id && file.type.startsWith('audio/') && (
+                    {playingAudio === file.id && file.type.startsWith('audio/') && file.url && (
                       <div className="mt-3 pt-3 border-t">
                         <audio 
                           src={file.url} 
@@ -301,7 +485,7 @@ export default function FileUploader() {
           <div className="text-center py-16">
             <File className="w-20 h-20 mx-auto text-gray-300 mb-4" />
             <p className="text-gray-500 text-lg">
-              No files uploaded yet. Start by uploading some files above.
+              No files shared yet. Upload a file to share with everyone!
             </p>
           </div>
         )}
@@ -332,7 +516,7 @@ export default function FileUploader() {
               </div>
               
               <div className="p-6">
-                {viewingFile.type.startsWith('image/') && (
+                {viewingFile.url && viewingFile.type.startsWith('image/') && (
                   <img 
                     src={viewingFile.url} 
                     alt={viewingFile.name}
@@ -340,7 +524,7 @@ export default function FileUploader() {
                   />
                 )}
                 
-                {viewingFile.type.startsWith('video/') && (
+                {viewingFile.url && viewingFile.type.startsWith('video/') && (
                   <video 
                     src={viewingFile.url} 
                     controls
@@ -349,7 +533,7 @@ export default function FileUploader() {
                   />
                 )}
                 
-                {viewingFile.type.startsWith('audio/') && (
+                {viewingFile.url && viewingFile.type.startsWith('audio/') && (
                   <div className="flex flex-col items-center justify-center py-12">
                     <Music className="w-24 h-24 mb-6 text-purple-600" />
                     <audio src={viewingFile.url} controls className="w-full max-w-md" autoPlay />
@@ -364,7 +548,7 @@ export default function FileUploader() {
                   </div>
                 )}
 
-                {(viewingFile.type === 'application/pdf' || 
+                {viewingFile.url && (viewingFile.type === 'application/pdf' || 
                   viewingFile.type.includes('pdf')) && (
                   <div className="w-full h-[600px]">
                     <iframe
@@ -375,7 +559,7 @@ export default function FileUploader() {
                   </div>
                 )}
 
-                {(viewingFile.type.includes('document') || 
+                {viewingFile.url && (viewingFile.type.includes('document') || 
                   viewingFile.type.includes('word') || 
                   viewingFile.type.includes('msword') ||
                   viewingFile.type.includes('officedocument')) && (
@@ -394,7 +578,7 @@ export default function FileUploader() {
                   </div>
                 )}
 
-                {isApkFile(viewingFile) && (
+                {viewingFile.url && isApkFile(viewingFile) && (
                   <div className="text-center py-12">
                     <FileText className="w-24 h-24 mx-auto mb-4 text-green-600" />
                     <p className="text-gray-700 mb-2 text-lg font-semibold">{viewingFile.name}</p>
@@ -424,7 +608,7 @@ export default function FileUploader() {
                   </div>
                 )}
 
-                {!viewingFile.type.startsWith('image/') && 
+                {(!viewingFile.url || (!viewingFile.type.startsWith('image/') && 
                  !viewingFile.type.startsWith('video/') && 
                  !viewingFile.type.startsWith('audio/') && 
                  viewingFile.type !== 'text/plain' &&
@@ -432,21 +616,23 @@ export default function FileUploader() {
                  !viewingFile.type.includes('document') &&
                  !viewingFile.type.includes('word') &&
                  !viewingFile.type.includes('officedocument') &&
-                 !isApkFile(viewingFile) && (
+                 !isApkFile(viewingFile))) && (
                   <div className="text-center py-12">
                     <div className="w-24 h-24 mx-auto mb-4 text-gray-400 flex items-center justify-center">
                       {getFileIcon(viewingFile)}
                     </div>
                     <p className="text-gray-700 mb-2 text-lg font-semibold">{viewingFile.name}</p>
                     <p className="text-gray-500 mb-6">Preview not available for this file type</p>
-                    <a
-                      href={viewingFile.url}
-                      download={viewingFile.name}
-                      className="inline-flex items-center gap-2 px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
-                    >
-                      <Download className="w-5 h-5" />
-                      Download File
-                    </a>
+                    {viewingFile.url && (
+                      <a
+                        href={viewingFile.url}
+                        download={viewingFile.name}
+                        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                      >
+                        <Download className="w-5 h-5" />
+                        Download File
+                      </a>
+                    )}
                   </div>
                 )}
               </div>
