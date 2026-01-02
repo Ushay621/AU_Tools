@@ -11,6 +11,7 @@ interface StoredFile {
 class FileStore {
   private files: Map<string, StoredFile> = new Map();
   private listeners: Set<(files: StoredFile[]) => void> = new Set();
+  private uploaderSessionId: string | null = null;
 
   addFile(file: StoredFile) {
     this.files.set(file.id, file);
@@ -32,7 +33,28 @@ class FileStore {
 
   clearAll() {
     this.files.clear();
+    this.uploaderSessionId = null;
     this.notifyListeners();
+  }
+
+  setUploaderSession(sessionId: string) {
+    this.uploaderSessionId = sessionId;
+  }
+
+  getUploaderSession(): string | null {
+    return this.uploaderSessionId;
+  }
+
+  clearIfUploaderRefreshed(sessionId: string) {
+    // If there are files and the session ID doesn't match the uploader's session,
+    // it means uploader refreshed (got new session), so clear all files
+    // This ensures files are only visible until uploader's device refreshes
+    if (this.files.size > 0 && this.uploaderSessionId && this.uploaderSessionId !== sessionId) {
+      console.log('Uploader refreshed - clearing all files. Old session:', this.uploaderSessionId, 'New session:', sessionId);
+      this.clearAll();
+      return true;
+    }
+    return false;
   }
 
   addListener(listener: (files: StoredFile[]) => void) {

@@ -25,68 +25,18 @@ export default function FileUploader() {
   const [playingAudio, setPlayingAudio] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const fileCacheRef = useRef<Map<string, UploadedFile>>(new Map());
-  const eventSourceRef = useRef<EventSource | null>(null);
-
-  // Connect to Server-Sent Events for real-time updates
-  useEffect(() => {
-    const connectSSE = () => {
-      try {
-        const eventSource = new EventSource('/api/files/stream');
-        eventSourceRef.current = eventSource;
-
-        eventSource.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.files) {
-              syncFiles(data.files as FileMetadata[]);
-            }
-          } catch (error) {
-            console.error('Error parsing SSE message:', error);
-          }
-        };
-
-        eventSource.onerror = (error) => {
-          console.error('SSE error:', error);
-          eventSource.close();
-          // Reconnect after 3 seconds
-          setTimeout(connectSSE, 3000);
-        };
-      } catch (error) {
-        console.error('Error connecting to SSE:', error);
-      }
-    };
-
-    connectSSE();
-
-    // Initial load
-    fetchFiles();
-
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
-      // Clean up object URLs
-      fileCacheRef.current.forEach(file => {
-        if (file.url && file.url.startsWith('blob:')) {
-          URL.revokeObjectURL(file.url);
-        }
-      });
-    };
-  }, []);
-
-  const fetchFiles = async () => {
-    try {
-      const response = await fetch('/api/files');
-      const data = await response.json();
-      if (data.files) {
-        syncFiles(data.files as FileMetadata[]);
-      }
-    } catch (error) {
-      console.error('Error fetching files:', error);
-    }
-  };
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  // Generate session ID (changes on refresh)
+  const sessionIdRef = useRef<string>(Math.random().toString(36).substr(2, 9) + Date.now().toString(36));
 
   const syncFiles = async (fileMetadataList: FileMetadata[]) => {
+    if (!fileMetadataList || fileMetadataList.length === 0) {
+      setFiles([]);
+      return;
+    }
+
+    console.log('syncFiles called with:', fileMetadataList.length, 'files');
+    
     // Get current file IDs from cache
     const currentIds = new Set(Array.from(fileCacheRef.current.keys()));
     const newIds = new Set(fileMetadataList.map(f => f.id));
@@ -112,6 +62,9 @@ export default function FileUploader() {
         // Fetch file data
         try {
           const response = await fetch(`/api/files/${metadata.id}`);
+          if (!response.ok) {
+            throw new Error(`Failed to fetch file ${metadata.id}`);
+          }
           const fileData = await response.json();
           
           const uploadedFile: UploadedFile = {
@@ -152,10 +105,65 @@ export default function FileUploader() {
       })
     );
 
+    console.log('Setting files:', updatedFiles.length, 'files', updatedFiles);
     setFiles(updatedFiles);
   };
 
+  // Poll for file updates
+  useEffect(() => {
+    // Initial load with session check
+    // This checks if uploader's device refreshed - if yes, files are cleared
+    const initialLoad = async () => {
+      try {
+        const response = await fetch(`/api/files?sessionId=${sessionIdRef.current}&initial=true`);
+        const data = await response.json();
+        if (data.cleared) {
+          // Files were cleared because uploader's device refreshed
+          console.log('Files cleared - uploader device refreshed');
+          fileCacheRef.current.clear();
+          setFiles([]);
+        } else if (data.files && data.files.length > 0) {
+          // Files exist - uploader's device hasn't refreshed yet
+          console.log('Files available - uploader session active');
+          await syncFiles(data.files as FileMetadata[]);
+        }
+      } catch (error) {
+        console.error('Error fetching files:', error);
+      }
+    };
+
+    initialLoad();
+
+    // Poll every 1 second for updates
+    pollingIntervalRef.current = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/files/stream`);
+        const data = await response.json();
+        if (data.files) {
+          await syncFiles(data.files as FileMetadata[]);
+        }
+      } catch (error) {
+        console.error('Error polling files:', error);
+      }
+    }, 1000);
+
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+      }
+      // Clean up object URLs
+      fileCacheRef.current.forEach(file => {
+        if (file.url && file.url.startsWith('blob:')) {
+          URL.revokeObjectURL(file.url);
+        }
+      });
+    };
+  }, []);
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Prevent any default behavior that might cause page refresh
+    e.stopPropagation();
+    
     const selectedFiles = Array.from(e.target.files || []);
     
     if (selectedFiles.length === 0) return;
@@ -167,6 +175,8 @@ export default function FileUploader() {
       selectedFiles.forEach(file => {
         formData.append('files', file);
       });
+      // Send session ID to track uploader
+      formData.append('sessionId', sessionIdRef.current);
 
       const response = await fetch('/api/files', {
         method: 'POST',
@@ -177,10 +187,26 @@ export default function FileUploader() {
         throw new Error('Failed to upload files');
       }
 
+      const uploadResult = await response.json();
+      console.log('Upload result:', uploadResult);
+
       // Reset input
       e.target.value = '';
       
-      // Files will be synced via SSE
+      // Immediately fetch all files after upload to show them right away
+      try {
+        const fetchResponse = await fetch('/api/files/stream');
+        const fetchData = await fetchResponse.json();
+        console.log('Files fetched after upload:', fetchData);
+        if (fetchData.files && Array.isArray(fetchData.files)) {
+          console.log('Calling syncFiles with', fetchData.files.length, 'files');
+          await syncFiles(fetchData.files as FileMetadata[]);
+        } else {
+          console.warn('No files in response or invalid format:', fetchData);
+        }
+      } catch (fetchError) {
+        console.error('Error fetching files after upload:', fetchError);
+      }
     } catch (error) {
       console.error('Error uploading files:', error);
       alert('Failed to upload files. Please try again.');
@@ -368,26 +394,28 @@ export default function FileUploader() {
         </div>
 
         <div className="mb-12">
-          <label className="block">
-            <div className={`relative border-4 border-dashed border-blue-400 rounded-2xl p-12 text-center cursor-pointer hover:border-blue-600 hover:bg-blue-50 transition-all duration-200 ${isUploading ? 'opacity-50 cursor-not-allowed' : ''}`}>
-              <div className="absolute -top-1 left-0 right-0 h-2 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 rounded-t-2xl"></div>
-              <Upload className="w-16 h-16 mx-auto mb-4 text-blue-500" />
-              <p className="text-xl font-semibold text-gray-700 mb-2">
-                {isUploading ? 'Uploading...' : 'Click to upload or drag and drop'}
-              </p>
-              <p className="text-sm text-gray-500">
-                Images, videos, documents, audio, APK files, and more
-              </p>
-              <input
-                type="file"
-                multiple
-                onChange={handleFileUpload}
-                className="hidden"
-                accept="*/*"
-                disabled={isUploading}
-              />
-            </div>
-          </label>
+          <div 
+            className={`relative border-4 border-dashed border-blue-400 rounded-2xl p-12 text-center cursor-pointer hover:border-blue-600 hover:bg-blue-50 transition-all duration-200 ${isUploading ? 'opacity-50 cursor-not-allowed' : ''}`}
+            onClick={() => !isUploading && document.getElementById('file-input')?.click()}
+          >
+            <div className="absolute -top-1 left-0 right-0 h-2 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 rounded-t-2xl"></div>
+            <Upload className="w-16 h-16 mx-auto mb-4 text-blue-500" />
+            <p className="text-xl font-semibold text-gray-700 mb-2">
+              {isUploading ? 'Uploading...' : 'Click to upload or drag and drop'}
+            </p>
+            <p className="text-sm text-gray-500">
+              Images, videos, documents, audio, APK files, and more
+            </p>
+            <input
+              id="file-input"
+              type="file"
+              multiple
+              onChange={handleFileUpload}
+              className="hidden"
+              accept="*/*"
+              disabled={isUploading}
+            />
+          </div>
         </div>
 
         {files.length > 0 && (

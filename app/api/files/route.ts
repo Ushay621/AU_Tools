@@ -5,9 +5,15 @@ export async function POST(request: NextRequest) {
     try {
         const formData = await request.formData();
         const files = formData.getAll('files') as File[];
+        const sessionId = formData.get('sessionId') as string;
 
         if (!files || files.length === 0) {
             return NextResponse.json({ error: 'No files provided' }, { status: 400 });
+        }
+
+        // Set uploader session ID
+        if (sessionId) {
+            fileStore.setUploaderSession(sessionId);
         }
 
         const uploadedFiles = [];
@@ -45,8 +51,20 @@ export async function POST(request: NextRequest) {
     }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
     try {
+        const { searchParams } = new URL(request.url);
+        const sessionId = searchParams.get('sessionId');
+        const isInitialLoad = searchParams.get('initial') === 'true';
+
+        // Only check on initial load to avoid clearing on every poll
+        if (isInitialLoad && sessionId) {
+            const cleared = fileStore.clearIfUploaderRefreshed(sessionId);
+            if (cleared) {
+                return NextResponse.json({ files: [], cleared: true });
+            }
+        }
+
         const files = fileStore.getAllFiles();
 
         // Return file metadata without the actual data (to reduce response size)
@@ -58,7 +76,12 @@ export async function GET() {
             uploadedAt: file.uploadedAt,
         }));
 
-        return NextResponse.json({ files: fileList });
+        const uploaderSessionId = fileStore.getUploaderSession();
+
+        return NextResponse.json({
+            files: fileList,
+            uploaderSessionId: uploaderSessionId
+        });
     } catch (error) {
         console.error('Error fetching files:', error);
         return NextResponse.json({ error: 'Failed to fetch files' }, { status: 500 });
